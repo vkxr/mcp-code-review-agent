@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Number of eval cases to run (blank = all 30)"
+        required: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check --output-format=github .
+      - run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t mcp-code-review-agent .
+
+  eval:
+    # Runs the 30-case evaluation against the real Claude API on every push to main.
+    # Add ANTHROPIC_API_KEY under Settings -> Secrets and variables -> Actions to enable it.
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      REVIEW_MODEL: ${{ vars.REVIEW_MODEL || 'claude-sonnet-5-5' }}
+      REVIEW_PRICE_PER_MTOK: ${{ vars.REVIEW_PRICE_PER_MTOK }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e .
+      - name: Run evals
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          ARGS="--model $REVIEW_MODEL"
+          if [ -n "${{ inputs.limit }}" ]; then ARGS="$ARGS --limit ${{ inputs.limit }}"; fi
+          if [ -n "${{ vars.EVAL_MIN_DETECTION }}" ]; then ARGS="$ARGS --min-detection ${{ vars.EVAL_MIN_DETECTION }}"; fi
+          python -m evals.run_eval $ARGS
+          cat evals/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Skip notice
+        if: env.ANTHROPIC_API_KEY == ''
+        run: echo "ANTHROPIC_API_KEY secret not set; skipping evals." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: env.ANTHROPIC_API_KEY != ''
+        with:
+          name: eval-results
+          path: evals/results/
